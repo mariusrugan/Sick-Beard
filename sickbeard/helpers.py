@@ -25,6 +25,8 @@ import shutil
 import traceback
 import time, sys
 
+from httplib import BadStatusLine
+
 from xml.dom.minidom import Node
 
 import sickbeard
@@ -128,12 +130,12 @@ def getURL (url, headers=[]):
     opener.addheaders = [('User-Agent', USER_AGENT), ('Accept-Encoding', 'gzip,deflate')]
     for cur_header in headers:
         opener.addheaders.append(cur_header)
-    usock = opener.open(url)
-    url = usock.geturl()
-
-    encoding = usock.info().get("Content-Encoding")
 
     try:
+        usock = opener.open(url)
+        url = usock.geturl()
+        encoding = usock.info().get("Content-Encoding")
+
         if encoding in ('gzip', 'x-gzip', 'deflate'):
             content = usock.read()
             if encoding == 'deflate':
@@ -144,15 +146,26 @@ def getURL (url, headers=[]):
 
         else:
             result = usock.read()
-            usock.close()
+
+        usock.close()
+
+    except urllib2.HTTPError, e:
+        logger.log(u"HTTP error " + str(e.code) + " while loading URL " + url, logger.WARNING)
+        return None
+    except urllib2.URLError, e:
+        logger.log(u"URL error " + str(e.reason) + " while loading URL " + url, logger.WARNING)
+        return None
+    except BadStatusLine:
+        logger.log(u"BadStatusLine error while loading URL " + url, logger.WARNING)
+        return None
     except socket.timeout:
-        logger.log(u"Timed out while loading URL "+url, logger.WARNING)
+        logger.log(u"Timed out while loading URL " + url, logger.WARNING)
         return None
     except ValueError:
-        logger.log(u"Unknown error while loading URL "+url, logger.WARNING)
+        logger.log(u"Unknown error while loading URL " + url, logger.WARNING)
         return None
     except Exception:
-        logger.log(u"Unknown exception while loading URL "+url+": "+traceback.format_exc(), logger.WARNING)
+        logger.log(u"Unknown exception while loading URL " + url + ": " + traceback.format_exc(), logger.WARNING)
         return None
 
     return result
@@ -420,77 +433,105 @@ def make_dirs(path):
     parents
     """
 
-    logger.log(u"Checking if the path "+path+" already exists", logger.DEBUG)
+    logger.log(u"Checking if the path " + path + " already exists", logger.DEBUG)
 
-    sofar = ''
-    folder_list = path.split(os.path.sep)
+    if not ek.ek(os.path.isdir, path):
+        # Windows, create all missing folders
+        if os.name == 'nt' or os.name == 'ce':
+            try:
+                logger.log(u"Folder " + path + " didn't exist, creating it", logger.DEBUG)
+                ek.ek(os.makedirs, path)
+            except (OSError, IOError), e:
+                logger.log(u"Failed creating " + path + " : " + ex(e), logger.ERROR)
+                return False
 
-    # look through each subfolder and make sure they all exist
-    for cur_folder in folder_list:
-        sofar += cur_folder + os.path.sep;
+        # not Windows, create all missing folders and set permissions
+        else:
+            sofar = ''
+            folder_list = path.split(os.path.sep)
 
-        # if it exists then just keep walking down the line
-        if ek.ek(os.path.isdir, sofar):
-            continue
+            # look through each subfolder and make sure they all exist
+            for cur_folder in folder_list:
+                sofar += cur_folder + os.path.sep;
 
-        try:
-            logger.log(u"Folder "+sofar+" didn't exist, creating it", logger.DEBUG)
-            ek.ek(os.mkdir, sofar)
-            chmodAsParent(sofar)
-        except OSError, IOError:
-            return False
-    
+                # if it exists then just keep walking down the line
+                if ek.ek(os.path.isdir, sofar):
+                    continue
+
+                try:
+                    logger.log(u"Folder " + sofar + " didn't exist, creating it", logger.DEBUG)
+                    ek.ek(os.mkdir, sofar)
+                    # use normpath to remove end separator, otherwise checks permissions against itself
+                    chmodAsParent(ek.ek(os.path.normpath, sofar))
+                except (OSError, IOError), e:
+                    logger.log(u"Failed creating " + sofar + " : " + ex(e), logger.ERROR)
+                    return False
+
     return True
+
 
 def rename_ep_file(cur_path, new_path):
     """
     Creates all folders needed to move a file to its new location, renames it, then cleans up any folders
     left that are now empty.
-    
+
     cur_path: The absolute path to the file you want to move/rename
     new_path: The absolute path to the destination for the file WITHOUT THE EXTENSION
     """
-    
-    logger.log(u"Renaming file from "+cur_path+" to "+new_path)
-    
+
     new_dest_dir, new_dest_name = os.path.split(new_path) #@UnusedVariable
     cur_file_name, cur_file_ext = os.path.splitext(cur_path) #@UnusedVariable
-    
+
     # put the extension on the incoming file
     new_path += cur_file_ext
-    
+
     make_dirs(os.path.dirname(new_path))
-    
+
     # move the file
     try:
+        logger.log(u"Renaming file from " + cur_path + " to " + new_path)
         ek.ek(os.rename, cur_path, new_path)
     except (OSError, IOError), e:
         logger.log(u"Failed renaming " + cur_path + " to " + new_path + ": " + ex(e), logger.ERROR)
         return False
-    
+
     # clean up any old folders that are empty
     delete_empty_folders(ek.ek(os.path.dirname, cur_path))
-    
+
     return True
-    
-def delete_empty_folders(check_empty_dir):
+
+
+def delete_empty_folders(check_empty_dir, keep_dir=None):
     """
     Walks backwards up the path and deletes any empty folders found.
-    
+
     check_empty_dir: The path to clean (absolute path to a folder)
+    keep_dir: Clean until this path is reached
     """
-    
-    logger.log(u"Trying to clean any empty folders under "+check_empty_dir)
-    
+
+    # treat check_empty_dir as empty when it only contains these items
+    ignore_items = []
+
+    logger.log(u"Trying to clean any empty folders under " + check_empty_dir)
+
     # as long as the folder exists and doesn't contain any files, delete it
-    while os.path.isdir(check_empty_dir) and not os.listdir(check_empty_dir):
-        logger.log(u"Deleting empty folder: "+check_empty_dir)
-        try:
-            os.rmdir(check_empty_dir)
-        except (WindowsError, OSError), e:
-            logger.log(u"Unable to delete "+check_empty_dir+": "+repr(e)+" / "+str(e), logger.WARNING)
+    while ek.ek(os.path.isdir, check_empty_dir) and check_empty_dir != keep_dir:
+
+        check_files = ek.ek(os.listdir, check_empty_dir)
+
+        if not check_files or (len(check_files) <= len(ignore_items) and all([check_file in ignore_items for check_file in check_files])):
+            # directory is empty or contains only ignore_items
+            try:
+                logger.log(u"Deleting empty folder: " + check_empty_dir)
+                # need shutil.rmtree when ignore_items is really implemented
+                ek.ek(os.rmdir, check_empty_dir)
+            except (WindowsError, OSError), e:
+                logger.log(u"Unable to delete " + check_empty_dir + ": " + repr(e) + " / " + str(e), logger.WARNING)
+                break
+            check_empty_dir = ek.ek(os.path.dirname, check_empty_dir)
+        else:
             break
-        check_empty_dir = os.path.basename(check_empty_dir)
+
 
 def chmodAsParent(childPath):
     if os.name == 'nt' or os.name == 'ce':
@@ -574,10 +615,10 @@ def sanitizeSceneName (name, ezrss=False):
     """
 
     if not ezrss:
-        bad_chars = ",:()'!?"
+        bad_chars = u",:()'!?\u2019"
     # ezrss leaves : and ! in their show names as far as I can tell
     else:
-        bad_chars = ",()'?"
+        bad_chars = u",()'?\u2019"
 
     # strip out any bad chars
     for x in bad_chars:

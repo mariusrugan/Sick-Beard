@@ -463,11 +463,11 @@ class Manage:
 
             if curErrors:
                 logger.log(u"Errors: "+str(curErrors), logger.ERROR)
-                errors.append('<b>%s:</b><br />\n<ul>' % showObj.name + '\n'.join(['<li>%s</li>' % error for error in curErrors]) + "</ul>")
+                errors.append('<b>%s:</b>\n<ul>' % showObj.name + ' '.join(['<li>%s</li>' % error for error in curErrors]) + "</ul>")
 
         if len(errors) > 0:
             ui.notifications.error('%d error%s while saving changes:' % (len(errors), "" if len(errors) == 1 else "s"),
-                        "<br />\n".join(errors))
+                        " ".join(errors))
 
         redirect("/manage")
 
@@ -904,7 +904,7 @@ class ConfigPostProcessing:
 
         if self.isNamingValid(naming_abd_pattern, None, True) != "invalid":
             sickbeard.NAMING_ABD_PATTERN = naming_abd_pattern
-        else:
+        elif naming_custom_abd:
             results.append("You tried saving an invalid air-by-date naming config, not saving your air-by-date settings")
 
         sickbeard.USE_BANNER = use_banner
@@ -1460,7 +1460,7 @@ def HomeMenu():
         { 'title': 'Update XBMC',            'path': 'home/updateXBMC/', 'requires': haveXBMC                   },
         { 'title': 'Update Plex',            'path': 'home/updatePLEX/', 'requires': havePLEX                   },
         { 'title': 'Restart',                'path': 'home/restart/?pid='+str(sickbeard.PID), 'confirm': True   },
-        { 'title': 'Shutdown',               'path': 'home/shutdown/', 'confirm': True                          },
+        { 'title': 'Shutdown',               'path': 'home/shutdown/?pid='+str(sickbeard.PID), 'confirm': True                          },
     ]
 
 class HomePostProcess:
@@ -1475,7 +1475,7 @@ class HomePostProcess:
     @cherrypy.expose
     def processEpisode(self, dir=None, nzbName=None, jobName=None, quiet=None):
 
-        if dir == None:
+        if not dir:
             redirect("/home/postprocess")
         else:
             result = processTV.processDir(dir, nzbName)
@@ -1519,41 +1519,51 @@ class NewHomeAddShows:
         baseURL = "http://thetvdb.com/api/GetSeries.php?"
         nameUTF8 = name.encode('utf-8')
 
+        logger.log(u"Trying to find Show on thetvdb.com with: " + nameUTF8.decode('utf-8'), logger.DEBUG)
+
         # Use each word in the show's name as a possible search term
         keywords = nameUTF8.split(' ')
 
         # Insert the whole show's name as the first search term so best results are first
         # ex: keywords = ['Some Show Name', 'Some', 'Show', 'Name']
-        keywords.insert(0, nameUTF8)
+        if len(keywords) > 1:
+            keywords.insert(0, nameUTF8)
 
         # Query the TVDB for each search term and build the list of results
         results = []
+
         for searchTerm in keywords:
             params = {'seriesname': searchTerm,
                   'language': lang}
 
             finalURL = baseURL + urllib.urlencode(params)
 
+            logger.log(u"Searching for Show with searchterm: \'" + searchTerm.decode('utf-8')+ u"\' on URL " + finalURL, logger.DEBUG)
             urlData = helpers.getURL(finalURL)
 
-            try:
-                seriesXML = etree.ElementTree(etree.XML(urlData))
-                series = seriesXML.getiterator('Series')
+            if urlData is None:
+                # When urlData is None, trouble connecting to TVDB, don't try the rest of the keywords
+                logger.log(u"Unable to get URL: " + finalURL, logger.ERROR)
+                break
+            else:
+                try:
+                    seriesXML = etree.ElementTree(etree.XML(urlData))
+                    series = seriesXML.getiterator('Series')
 
-            except Exception, e:
-                # use finalURL in log, because urlData can be too much information
-                logger.log(u"Unable to parse XML for some reason: "+ex(e)+" from XML: "+finalURL, logger.ERROR)
-                series = ''
+                except Exception, e:
+                    # use finalURL in log, because urlData can be too much information
+                    logger.log(u"Unable to parse XML for some reason: "+ex(e)+" from XML: "+finalURL, logger.ERROR)
+                    series = ''
 
-            # add each result to our list
-            for curSeries in series:
-                tvdb_id = int(curSeries.findtext('seriesid'))
-                
-                # don't add duplicates
-                if tvdb_id in [x[0] for x in results]:
-                    continue
-                
-                results.append((tvdb_id, curSeries.findtext('SeriesName'), curSeries.findtext('FirstAired')))
+                # add each result to our list
+                for curSeries in series:
+                    tvdb_id = int(curSeries.findtext('seriesid'))
+
+                    # don't add duplicates
+                    if tvdb_id in [x[0] for x in results]:
+                        continue
+
+                    results.append((tvdb_id, curSeries.findtext('SeriesName'), curSeries.findtext('FirstAired')))
 
         lang_id = tvdb_api.Tvdb().config['langabbv_to_id'][lang]
 
@@ -2112,7 +2122,10 @@ class Home:
             return "Test NMA notice failed"
 
     @cherrypy.expose
-    def shutdown(self):
+    def shutdown(self, pid=None):
+
+        if str(pid) != str(sickbeard.PID):
+            redirect("/home")
 
         threading.Timer(2, sickbeard.invoke_shutdown).start()
 
@@ -2160,8 +2173,7 @@ class Home:
             showObj = sickbeard.helpers.findCertainShow(sickbeard.showList, int(show))
 
             if showObj == None:
-
-                return _genericMessage("Error", "Unable to find the specified show.")
+                return _genericMessage("Error", "Show not in show list")
 
         myDB = db.DBConnection()
 
@@ -2206,7 +2218,7 @@ class Home:
                 t.submenu.append({ 'title': 'Re-scan files',        'path': 'home/refreshShow?show=%d'%showObj.tvdbid })
                 t.submenu.append({ 'title': 'Force Full Update',    'path': 'home/updateShow?show=%d&amp;force=1'%showObj.tvdbid })
                 t.submenu.append({ 'title': 'Update show in XBMC',  'path': 'home/updateXBMC?showName=%s'%urllib.quote_plus(showObj.name.encode('utf-8')), 'requires': haveXBMC })
-                t.submenu.append({ 'title': 'Rename Episodes',      'path': 'home/testRename?show=%d'%showObj.tvdbid })
+                t.submenu.append({ 'title': 'Preview Rename',       'path': 'home/testRename?show=%d'%showObj.tvdbid })
 
         t.show = showObj
         t.sqlResults = sqlResults
@@ -2548,26 +2560,38 @@ class Home:
         if showObj == None:
             return _genericMessage("Error", "Show not in show list")
 
-        ep_obj_list = []
-
-        myDB = db.DBConnection()
-        ep_list = myDB.select("SELECT * FROM tv_episodes WHERE showid = ? AND location != '' GROUP BY location ORDER BY season*1000+episode", [show])
-
         try:
             show_loc = showObj.location #@UnusedVariable
         except exceptions.ShowDirNotFoundException:
             return _genericMessage("Error", "Can't rename episodes when the show dir is missing.")
 
-        for cur_ep in ep_list:
+        ep_obj_rename_list = []
 
-            # get the episode object
-            cur_ep_obj = showObj.makeEpFromFile(cur_ep["location"])
-            
-            ep_obj_list.append(cur_ep_obj)
-                
+        ep_obj_list = showObj.getAllEpisodes(has_location=True)
+
+        for cur_ep_obj in ep_obj_list:
+            # Only want to rename if we have a location
+            if cur_ep_obj.location:
+                if cur_ep_obj.relatedEps:
+                    # do we have one of multi-episodes in the rename list already
+                    have_already = False
+                    for cur_related_ep in cur_ep_obj.relatedEps + [cur_ep_obj]:
+                        if cur_related_ep in ep_obj_rename_list:
+                            have_already = True
+                            break
+                    if not have_already:
+                        ep_obj_rename_list.append(cur_ep_obj)
+
+                else:
+                    ep_obj_rename_list.append(cur_ep_obj)
+
+        if ep_obj_rename_list:
+            # present season DESC episode DESC on screen
+            ep_obj_rename_list.reverse()
+
         t = PageTemplate(file="testRename.tmpl")
-        t.submenu = [ { 'title': 'Edit', 'path': 'home/editShow?show=%d'%showObj.tvdbid } ]
-        t.ep_obj_list = ep_obj_list
+        t.submenu = [{'title': 'Edit', 'path': 'home/editShow?show=%d' % showObj.tvdbid}]
+        t.ep_obj_list = ep_obj_rename_list
         t.show = showObj
 
         return _munge(t)

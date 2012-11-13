@@ -116,18 +116,39 @@ class TVShow(object):
                 self.episodes[curSeason][curEp] = None
                 del myEp
 
-    def getAllEpisodes(self, season=None):
+    def getAllEpisodes(self, season=None, has_location=False):
 
         myDB = db.DBConnection()
-        if season == None:
-            results = myDB.select("SELECT season, episode FROM tv_episodes WHERE showid = ?", [self.tvdbid])
-        else:
-            results = myDB.select("SELECT season, episode FROM tv_episodes WHERE showid = ? AND season = ?", [self.tvdbid, season])
+
+        sql_selection = "SELECT season, episode, "
+
+        # subselection to detect multi-episodes early, share_location > 0
+        sql_selection = sql_selection + " (SELECT COUNT (*) FROM tv_episodes WHERE showid = tve.showid AND season = tve.season AND location != '' AND location = tve.location AND episode != tve.episode) AS share_location "
+
+        sql_selection = sql_selection + " FROM tv_episodes tve WHERE showid = " + str(self.tvdbid)
+
+        if season is not None:
+            sql_selection = sql_selection + " AND season = " + str(season)
+        if has_location:
+            sql_selection = sql_selection + " AND location != '' "
+
+        # need ORDER episode ASC to rename multi-episodes in order S01E01-02
+        sql_selection = sql_selection + " ORDER BY season ASC, episode ASC"
+
+        results = myDB.select(sql_selection)
 
         ep_list = []
         for cur_result in results:
             cur_ep = self.getEpisode(int(cur_result["season"]), int(cur_result["episode"]))
             if cur_ep:
+                if cur_ep.location:
+                    # if there is a location, check if it's a multi-episode (share_location > 0) and put them in relatedEps
+                    if cur_result["share_location"] > 0:
+                        related_eps_result = myDB.select("SELECT * FROM tv_episodes WHERE showid = ? AND season = ? AND location = ? AND episode != ? ORDER BY episode ASC", [self.tvdbid, cur_ep.season, cur_ep.location, cur_ep.episode])
+                        for cur_related_ep in related_eps_result:
+                            related_ep = self.getEpisode(int(cur_related_ep["season"]), int(cur_related_ep["episode"]))
+                            if related_ep not in cur_ep.relatedEps:
+                                cur_ep.relatedEps.append(related_ep)
                 ep_list.append(cur_ep)
 
         return ep_list
@@ -223,8 +244,12 @@ class TVShow(object):
                 curEpisode = self.makeEpFromFile(ek.ek(os.path.join, self._location, mediaFile))
             except (exceptions.ShowNotFoundException, exceptions.EpisodeNotFoundException), e:
                 logger.log(u"Episode "+mediaFile+" returned an exception: "+ex(e), logger.ERROR)
+                continue
             except exceptions.EpisodeDeletedException:
                 logger.log(u"The episode deleted itself when I tried making an object for it", logger.DEBUG)
+
+            if curEpisode is None:
+                continue
 
             # see if we should save the release name in the db
             ep_file_name = ek.ek(os.path.basename, curEpisode.location)
@@ -238,7 +263,7 @@ class TVShow(object):
                 pass
         
             if not ' ' in ep_file_name and parse_result and parse_result.release_group:
-                logger.log(u"Name "+ep_file_name+" gave release group of "+parse_result.release_group+", seems valid", logger.DEBUG)
+                logger.log(u"Name " + ep_file_name + " gave release group of " + parse_result.release_group + ", seems valid", logger.DEBUG)
                 curEpisode.release_name = ep_file_name
 
             # store the reference in the show
@@ -308,7 +333,7 @@ class TVShow(object):
         ltvdb_api_parms = sickbeard.TVDB_API_PARMS.copy()
 
         if not cache:
-            ltvdb_api_parms['cache'] = 'recache'
+            ltvdb_api_parms['cache'] = False
 
         if self.lang:
             ltvdb_api_parms['language'] = self.lang
@@ -600,7 +625,7 @@ class TVShow(object):
             ltvdb_api_parms = sickbeard.TVDB_API_PARMS.copy()
 
             if not cache:
-                ltvdb_api_parms['cache'] = 'recache'
+                ltvdb_api_parms['cache'] = False
             
             if self.lang:
                 ltvdb_api_parms['language'] = self.lang
@@ -999,24 +1024,25 @@ class TVEpisode(object):
 
         sqlResult = self.loadFromDB(season, episode)
 
-        # only load from NFO if we didn't load from DB
-        if ek.ek(os.path.isfile, self.location) and self.name == "":
-            try:
-                self.loadFromNFO(self.location)
-            except exceptions.NoNFOException:
-                logger.log(str(self.show.tvdbid) + ": There was an error loading the NFO for episode " + str(season) + "x" + str(episode), logger.ERROR)
-                pass
+        if not sqlResult:
+            # only load from NFO if we didn't load from DB
+            if ek.ek(os.path.isfile, self.location):
+                try:
+                    self.loadFromNFO(self.location)
+                except exceptions.NoNFOException:
+                    logger.log(str(self.show.tvdbid) + ": There was an error loading the NFO for episode " + str(season) + "x" + str(episode), logger.ERROR)
+                    pass
 
-        # if we tried loading it from NFO and didn't find the NFO, use TVDB
-        if self.hasnfo == False:
-            try:
-                result = self.loadFromTVDB(season, episode)
-            except exceptions.EpisodeDeletedException:
-                result = False
+                # if we tried loading it from NFO and didn't find the NFO, use TVDB
+                if self.hasnfo == False:
+                    try:
+                        result = self.loadFromTVDB(season, episode)
+                    except exceptions.EpisodeDeletedException:
+                        result = False
 
-            # if we failed TVDB, NFO *and* SQL then fail
-            if result == False and not sqlResult:
-                raise exceptions.EpisodeNotFoundException("Couldn't find episode " + str(season) + "x" + str(episode))
+                    # if we failed SQL *and* NFO, TVDB then fail
+                    if result == False:
+                        raise exceptions.EpisodeNotFoundException("Couldn't find episode " + str(season) + "x" + str(episode))
         
         # don't update if not needed
         if self.dirty:
@@ -1082,7 +1108,7 @@ class TVEpisode(object):
                     ltvdb_api_parms = sickbeard.TVDB_API_PARMS.copy()
 
                     if not cache:
-                        ltvdb_api_parms['cache'] = 'recache'
+                        ltvdb_api_parms['cache'] = False
 
                     if tvdb_lang:
                             ltvdb_api_parms['language'] = tvdb_lang
@@ -1420,9 +1446,18 @@ class TVEpisode(object):
         
         def us(name):
             return re.sub('[ -]','_', name)
-        
+
+        def release_name(name):
+            if name and name.lower().endswith('.nzb'):
+                name = name.rpartition('.')[0]
+            return name
+
         def release_group(name):
+            if not name:
+                return ''
+
             np = NameParser(name)
+
             try:
                 parse_result = np.parse(name)
             except InvalidNameException, e:
@@ -1449,7 +1484,7 @@ class TVEpisode(object):
                    '%0S': '%02d' % self.season,
                    '%E': str(self.episode),
                    '%0E': '%02d' % self.episode,
-                   '%RN': self.release_name,
+                   '%RN': release_name(self.release_name),
                    '%RG': release_group(self.release_name),
                    '%AD': str(self.airdate).replace('-', ' '),
                    '%A.D': str(self.airdate).replace('-', '.'),
@@ -1475,13 +1510,11 @@ class TVEpisode(object):
             result_name = result_name.replace(cur_replacement.lower(), helpers.sanitizeFileName(replace_map[cur_replacement].lower()))
 
         return result_name
-        
+
     def _format_pattern(self, pattern=None, multi=None):
         """
         Manipulates an episode naming pattern and then fills the template in
         """
-        
-        logger.log(u"pattern: "+pattern, logger.DEBUG)
         
         if pattern == None:
             pattern = sickbeard.NAMING_PATTERN
@@ -1586,10 +1619,13 @@ class TVEpisode(object):
             # fill out the template for this piece and then insert this piece into the actual pattern
             cur_name_group_result = re.sub('(?i)(?x)'+regex_used, regex_replacement, cur_name_group)
             #cur_name_group_result = cur_name_group.replace(ep_format, ep_string)
-            logger.log(u"found "+ep_format+" as the ep pattern using "+regex_used+" and replaced it with "+regex_replacement+" to result in "+cur_name_group_result+" from "+cur_name_group, logger.DEBUG)
+            #logger.log(u"found "+ep_format+" as the ep pattern using "+regex_used+" and replaced it with "+regex_replacement+" to result in "+cur_name_group_result+" from "+cur_name_group, logger.DEBUG)
             result_name = result_name.replace(cur_name_group, cur_name_group_result)
 
         result_name = self._format_string(result_name, replace_map)
+
+        logger.log(u"formatting pattern: "+pattern+" -> "+result_name, logger.DEBUG)
+        
         
         return result_name
 
@@ -1654,7 +1690,11 @@ class TVEpisode(object):
         Renames an episode file and all related files to the location and filename as specified
         in the naming settings.
         """
-        
+
+        if not ek.ek(os.path.isfile, self.location):
+            logger.log(u"Can't perform rename on " + self.location + " when it doesn't exist, skipping", logger.WARNING)
+            return
+
         proper_path = self.proper_path()
         absolute_proper_path = ek.ek(os.path.join, self.show.location, proper_path)
         absolute_current_path_no_ext, file_ext = os.path.splitext(self.location)
@@ -1664,7 +1704,7 @@ class TVEpisode(object):
         if absolute_current_path_no_ext.startswith(self.show.location):
             current_path = absolute_current_path_no_ext[len(self.show.location):]
 
-        logger.log(u"Renaming/moving episode from the base path "+self.location+" to "+absolute_proper_path, logger.DEBUG)
+        logger.log(u"Renaming/moving episode from the base path " + self.location + " to " + absolute_proper_path, logger.DEBUG)
 
         # if it's already named correctly then don't do anything
         if proper_path == current_path:
@@ -1672,16 +1712,16 @@ class TVEpisode(object):
             return
 
         related_files = postProcessor.PostProcessor(self.location)._list_associated_files(self.location)
-        logger.log(u"Files associated to "+self.location+": "+str(related_files), logger.DEBUG)
+        logger.log(u"Files associated to " + self.location + ": " + str(related_files), logger.DEBUG)
 
         # move the ep file
         result = helpers.rename_ep_file(self.location, absolute_proper_path)
-        
+
         # move related files
         for cur_related_file in related_files:
             cur_result = helpers.rename_ep_file(cur_related_file, absolute_proper_path)
             if cur_result == False:
-                logger.log(str(self.tvdbid) + ": Unable to rename file "+cur_related_file, logger.ERROR)
+                logger.log(str(self.tvdbid) + ": Unable to rename file " + cur_related_file, logger.ERROR)
 
         # save the ep
         with self.lock:
@@ -1691,7 +1731,7 @@ class TVEpisode(object):
                     relEp.location = absolute_proper_path + file_ext
 
         # in case something changed with the metadata just do a quick check
-        for curEp in [self]+self.relatedEps:
+        for curEp in [self] + self.relatedEps:
             curEp.checkForMetaFiles()
 
         # save any changes to the database
